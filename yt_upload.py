@@ -9,10 +9,14 @@ resumable chunked video uploads, custom thumbnails, and post-upload metadata edi
 """
 
 import argparse
+import base64
+import hashlib
+import http.client
 import http.server
 import json
 import mimetypes
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -26,6 +30,10 @@ from pathlib import Path
 UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 MANAGE_SCOPE = "https://www.googleapis.com/auth/youtube"
 SCOPES = f"{UPLOAD_SCOPE} {MANAGE_SCOPE}"
+UPLOAD_INIT_URL = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status"
+OAUTH_TIMEOUT_SECONDS = 300
+UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024  # must be a multiple of 256 KiB
+UPLOAD_MAX_RETRIES = 10
 
 CONFIG_DIR = Path.home() / ".config" / "youtube_uploader"
 DEFAULT_TOKEN_PATH = CONFIG_DIR / "token.json"
@@ -47,18 +55,37 @@ ANDROID_FONTS = [
 ]
 
 
+def write_private(path: Path, data: str | bytes) -> None:
+    """Write a file readable only by the current user (tokens and secrets)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data.encode("utf-8") if isinstance(data, str) else data)
+    os.chmod(path, 0o600)
+
+
+def load_client_info(path: Path) -> dict:
+    """Parse a client_secret.json and return its 'installed' (or 'web') section."""
+    data = json.loads(path.read_text())
+    info = data.get("installed") or data.get("web")
+    if not info or "client_id" not in info or "client_secret" not in info:
+        raise ValueError(
+            f"{path} is not a valid OAuth client secret (expected an 'installed' "
+            "Desktop app client with client_id and client_secret)."
+        )
+    return info
+
+
 def find_client_secret(custom_path: str | None = None) -> dict:
     """Locate and load the OAuth client_secret.json file."""
     if custom_path:
         p = Path(custom_path).expanduser().resolve()
         if not p.exists():
             raise FileNotFoundError(f"Specified client secret not found: {p}")
-        data = json.loads(p.read_text())
-        return data.get("installed") or data.get("web")
+        return load_client_info(p)
 
     if DEFAULT_SECRET_PATH.exists():
-        data = json.loads(DEFAULT_SECRET_PATH.read_text())
-        return data.get("installed") or data.get("web")
+        return load_client_info(DEFAULT_SECRET_PATH)
 
     candidates = []
     for folder in [Path.cwd(), CAMERA_DIR, DOWNLOAD_DIR]:
@@ -72,15 +99,15 @@ def find_client_secret(custom_path: str | None = None) -> dict:
             )
 
     if candidates:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         latest = candidates[0]
-        DEFAULT_SECRET_PATH.write_bytes(latest.read_bytes())
+        info = load_client_info(latest)
+        write_private(DEFAULT_SECRET_PATH, latest.read_bytes())
         print(f"Found and saved client secret from: {latest}")
-        data = json.loads(DEFAULT_SECRET_PATH.read_text())
-        return data.get("installed") or data.get("web")
+        return info
 
     raise FileNotFoundError(
-        "Could not find client_secret*.json in current directory or /storage/emulated/0/Download."
+        "Could not find client_secret*.json in the current directory, "
+        f"{CAMERA_DIR} or {DOWNLOAD_DIR}."
     )
 
 
@@ -159,13 +186,20 @@ def get_access_token(
                     )
                     if "scope" in refreshed:
                         token_data["scope"] = refreshed["scope"]
-                    DEFAULT_TOKEN_PATH.write_text(json.dumps(token_data, indent=2))
+                    write_private(DEFAULT_TOKEN_PATH, json.dumps(token_data, indent=2))
                     return token_data["access_token"]
                 except Exception as e:
                     print(f"Token refresh failed ({e}), re-authenticating...")
 
     # Start a local loopback HTTP server on an ephemeral port
     auth_result = {"code": None, "error": None}
+    state = secrets.token_urlsafe(24)
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
 
     class OAuthHandler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -175,12 +209,20 @@ def get_access_token(
                 self.end_headers()
                 return
             params = urllib.parse.parse_qs(parsed.query)
-            if "code" in params:
+            if "code" not in params and "error" not in params:
+                # Stray request (browser prefetch, etc.): ignore and keep waiting
+                self.send_response(404)
+                self.end_headers()
+                return
+            if params.get("state", [None])[0] != state:
+                body = b"<html><body><h2>Invalid OAuth state. Please retry from Termux.</h2></body></html>"
+                self.send_response(400)
+            elif "code" in params:
                 auth_result["code"] = params["code"][0]
                 body = b"<html><body style='font-family:sans-serif;text-align:center;padding:40px;'><h2>Authorization Successful!</h2><p>You can close this tab and return to Termux.</p></body></html>"
                 self.send_response(200)
             else:
-                auth_result["error"] = params.get("error", ["unknown_error"])[0]
+                auth_result["error"] = params["error"][0]
                 body = b"<html><body><h2>Authorization Failed.</h2></body></html>"
                 self.send_response(400)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -196,7 +238,7 @@ def get_access_token(
     except OSError:
         server = http.server.HTTPServer(("127.0.0.1", 0), OAuthHandler)
     port = server.server_port
-    redirect_uri = f"http://localhost:{port}"
+    redirect_uri = f"http://127.0.0.1:{port}"
 
     params = {
         "client_id": client_id,
@@ -205,6 +247,9 @@ def get_access_token(
         "scope": SCOPES,
         "access_type": "offline",
         "prompt": "consent",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     }
     authorize_url = f"{auth_uri}?{urllib.parse.urlencode(params)}"
 
@@ -215,9 +260,17 @@ def get_access_token(
     print("========================================================\n", flush=True)
 
     open_android_url(authorize_url)
-    while auth_result["code"] is None and auth_result["error"] is None:
-        server.handle_request()
-    server.server_close()
+    server.timeout = 1
+    deadline = time.time() + OAUTH_TIMEOUT_SECONDS
+    try:
+        while auth_result["code"] is None and auth_result["error"] is None:
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"Timed out after {OAUTH_TIMEOUT_SECONDS}s waiting for browser authorization."
+                )
+            server.handle_request()
+    finally:
+        server.server_close()
 
     if auth_result["error"] or not auth_result["code"]:
         raise RuntimeError(f"OAuth authorization failed: {auth_result['error']}")
@@ -230,10 +283,11 @@ def get_access_token(
             "client_secret": client_secret,
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
+            "code_verifier": code_verifier,
         },
     )
     token_resp["expires_at"] = time.time() + token_resp.get("expires_in", 3600)
-    DEFAULT_TOKEN_PATH.write_text(json.dumps(token_resp, indent=2))
+    write_private(DEFAULT_TOKEN_PATH, json.dumps(token_resp, indent=2))
     print(f"Authentication successful! Token saved to {DEFAULT_TOKEN_PATH}")
     return token_resp["access_token"]
 
@@ -386,15 +440,6 @@ def build_atempo_chain(speed: float) -> str:
     return ",".join(filters)
 
 
-def escape_drawtext(text: str) -> str:
-    """Escape text for FFmpeg drawtext filter."""
-    escaped = text.replace("\\", "\\\\")
-    escaped = escaped.replace(":", "\\:")
-    escaped = escaped.replace("'", "\u2019")
-    escaped = escaped.replace("%", "\\%")
-    return escaped
-
-
 def escape_filter_path(path: Path) -> str:
     """Escape a file path for use inside an FFmpeg filter argument (e.g. subtitles, fontfile)."""
     s = str(path.resolve())
@@ -410,6 +455,23 @@ def find_default_font() -> Path | None:
         if font.exists():
             return font
     return None
+
+
+def estimate_output_duration(probes: list[dict], args: argparse.Namespace) -> float:
+    """Estimate the edited output length in seconds (after merge, trim and speed)."""
+    total = sum(p["duration"] for p in probes)
+    start = parse_time_to_seconds(args.trim_start) or 0.0
+    end = parse_time_to_seconds(args.trim_end)
+    dur = parse_time_to_seconds(args.duration)
+    stop = total
+    if end is not None:
+        stop = min(stop, end)
+    elif dur is not None:
+        stop = min(stop, start + dur)
+    length = max(stop - start, 0.1)
+    if args.speed and args.speed > 0:
+        length /= args.speed
+    return length
 
 
 def has_editing_options(args: argparse.Namespace, num_inputs: int) -> bool:
@@ -673,11 +735,16 @@ def edit_video(
         escaped_sub = escape_filter_path(sub_path)
         next_v(f"subtitles='{escaped_sub}'")
 
-    # Step 7: Text Overlay (drawtext)
+    # Step 7: Text Overlay (drawtext). The text is passed via a temp file with
+    # expansion disabled so characters like % : ' \\ need no escaping.
+    text_file: Path | None = None
     if args.text:
         font_path = find_default_font()
         font_opt = f"fontfile='{escape_filter_path(font_path)}':" if font_path else ""
-        escaped_txt = escape_drawtext(args.text)
+        fd, tmp_txt = tempfile.mkstemp(prefix="yt_text_", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as tf:
+            tf.write(args.text)
+        text_file = Path(tmp_txt)
         y_map = {
             "top": "60",
             "center": "(h-text_h)/2",
@@ -685,7 +752,7 @@ def edit_video(
         }
         y_expr = y_map.get(args.text_pos, "h-text_h-80")
         next_v(
-            f"drawtext={font_opt}text='{escaped_txt}':"
+            f"drawtext={font_opt}textfile='{escape_filter_path(text_file)}':expansion=none:"
             f"fontsize={args.font_size}:fontcolor={args.font_color}:"
             f"x=(w-text_w)/2:y={y_expr}:"
             f"box=1:boxcolor=black@0.55:boxborderw=12"
@@ -720,9 +787,13 @@ def edit_video(
     if bgm_idx is not None:
         a_step += 1
         bgm_label = f"abgm{a_step}"
+        # The looped BGM input is infinite; bound it to the output length here
+        # instead of relying on -shortest (which fails on some ffmpeg builds).
+        out_dur = estimate_output_duration(probes, args)
         filter_parts.append(
             f"[{bgm_idx}:a]volume={args.bgm_volume},aresample=44100,"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo[{bgm_label}]"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"atrim=duration={out_dur:.3f}[{bgm_label}]"
         )
         if a_curr is not None:
             a_step += 1
@@ -741,8 +812,6 @@ def edit_video(
     if a_curr is not None:
         a_map = f"[{a_curr}]" if not a_curr.endswith(":a") else a_curr
         cmd.extend(["-map", a_map, "-c:a", "aac", "-b:a", "192k"])
-        if bgm_idx is not None and not has_source_audio:
-            cmd.append("-shortest")
     else:
         cmd.append("-an")
 
@@ -762,7 +831,11 @@ def edit_video(
     )
 
     print(f"Editing video with FFmpeg -> {output_path.name}...")
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        if text_file is not None:
+            text_file.unlink(missing_ok=True)
     size_mb = output_path.stat().st_size / (1024 * 1024)
     print(f"Edited video saved: {output_path} ({size_mb:.1f} MB)")
     return output_path
@@ -771,6 +844,60 @@ def edit_video(
 # =====================================================================
 # YouTube Data API v3 Upload, Thumbnails & Metadata Update
 # =====================================================================
+
+
+RETRYABLE_STATUS = (500, 502, 503, 504)
+
+
+def _received_bytes(headers) -> int:
+    """Parse the 'Range: bytes=0-N' header of a 308 response into a resume offset."""
+    rng = headers.get("Range") if headers else None
+    if not rng or "-" not in rng:
+        return 0
+    return int(rng.rsplit("-", 1)[1]) + 1
+
+
+def _query_upload_status(upload_url: str, file_size: int) -> tuple[int, dict | None]:
+    """Ask the resumable session how many bytes it has. Returns (offset, final_response)."""
+    req = urllib.request.Request(
+        upload_url,
+        data=b"",
+        headers={"Content-Length": "0", "Content-Range": f"bytes */{file_size}"},
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = resp.read().decode("utf-8")
+        return file_size, (json.loads(body) if body else {})
+    except urllib.error.HTTPError as e:
+        if e.code == 308:
+            return _received_bytes(e.headers), None
+        if e.code in RETRYABLE_STATUS:
+            raise  # HTTPError is an OSError: the caller retries it
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Upload session is no longer valid (HTTP {e.code}): {err_body}"
+        )
+
+
+def _recover_upload(
+    upload_url: str, file_size: int, retries: int, reason: str
+) -> tuple[int, dict | None, int]:
+    """Back off exponentially and re-sync the offset after a transient failure."""
+    while True:
+        retries += 1
+        if retries > UPLOAD_MAX_RETRIES:
+            raise RuntimeError(
+                f"Upload failed after {UPLOAD_MAX_RETRIES} retries (last error: {reason})."
+            )
+        wait = min(2**retries, 60)
+        print(f"Upload interrupted ({reason}); retry {retries}/{UPLOAD_MAX_RETRIES} in {wait}s...", flush=True)
+        time.sleep(wait)
+        try:
+            offset, final = _query_upload_status(upload_url, file_size)
+            return offset, final, retries
+        except (OSError, http.client.HTTPException) as e:
+            reason = f"{type(e).__name__}: {e}"
 
 
 def upload_video(
@@ -799,9 +926,8 @@ def upload_video(
     metadata_bytes = json.dumps(metadata).encode("utf-8")
     file_size = file_path.stat().st_size
 
-    init_url = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status"
     init_req = urllib.request.Request(
-        init_url,
+        UPLOAD_INIT_URL,
         data=metadata_bytes,
         headers={
             "Authorization": f"Bearer {access_token}",
@@ -813,7 +939,7 @@ def upload_video(
     )
 
     try:
-        with urllib.request.urlopen(init_req) as resp:
+        with urllib.request.urlopen(init_req, timeout=60) as resp:
             upload_url = resp.headers.get("Location")
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
@@ -825,43 +951,53 @@ def upload_video(
         )
 
     print(f"Uploading '{file_path.name}' ({file_size / (1024 * 1024):.1f} MB)...")
-    chunk_size = 8 * 1024 * 1024  # 8 MB chunks
     offset = 0
+    retries = 0
     response_data = None
 
     with file_path.open("rb") as f:
         while offset < file_size:
-            chunk = f.read(chunk_size)
-            chunk_len = len(chunk)
-            end_byte = offset + chunk_len - 1
-
+            f.seek(offset)
+            chunk = f.read(UPLOAD_CHUNK_SIZE)
+            end_byte = offset + len(chunk) - 1
             put_req = urllib.request.Request(
                 upload_url,
                 data=chunk,
                 headers={
-                    "Content-Length": str(chunk_len),
+                    "Content-Length": str(len(chunk)),
                     "Content-Range": f"bytes {offset}-{end_byte}/{file_size}",
                 },
                 method="PUT",
             )
             try:
-                with urllib.request.urlopen(put_req) as resp:
+                with urllib.request.urlopen(put_req, timeout=300) as resp:
                     resp_body = resp.read().decode("utf-8")
-                    if resp_body:
-                        response_data = json.loads(resp_body)
-                    offset += chunk_len
-                    print("Progress: 100%", flush=True)
+                response_data = json.loads(resp_body) if resp_body else {}
+                print("Progress: 100%", flush=True)
+                break
             except urllib.error.HTTPError as e:
                 if e.code == 308:
-                    # 308 Resume Incomplete is the expected response for intermediate chunks
-                    offset += chunk_len
-                    pct = int((offset / file_size) * 100)
-                    print(f"Progress: {pct}%", flush=True)
-                else:
+                    # Resume Incomplete: the server tells us how much it actually stored
+                    offset = _received_bytes(e.headers)
+                    retries = 0
+                    print(f"Progress: {int(offset / file_size * 100)}%", flush=True)
+                    continue
+                if e.code not in RETRYABLE_STATUS:
                     err_body = e.read().decode("utf-8", errors="replace")
                     raise RuntimeError(
                         f"Chunk upload failed (HTTP {e.code}): {err_body}"
                     )
+                reason = f"HTTP {e.code}"
+            except (OSError, http.client.HTTPException) as e:
+                reason = f"{type(e).__name__}: {e}"
+
+            # Transient failure: back off, ask the server where to resume, retry
+            offset, response_data, retries = _recover_upload(
+                upload_url, file_size, retries, reason
+            )
+            if response_data is not None:
+                print("Progress: 100%", flush=True)
+                break
 
     video_id = (response_data or {}).get("id", "unknown")
     print("\nUpload Complete!")
@@ -1228,9 +1364,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     meta_grp.add_argument(
         "--made-for-kids",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="Mark video as made for kids.",
+        help="Mark (or with --no-made-for-kids, unmark) the video as made for kids.",
     )
 
     return parser
@@ -1336,30 +1472,30 @@ def main():
         needs_edit = has_editing_options(args, len(inputs))
         temp_file_to_cleanup: Path | None = None
 
-        if needs_edit:
-            if args.output:
-                output_path = Path(args.output).expanduser().resolve()
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-            elif args.no_upload:
-                output_path = primary_video.with_name(f"{primary_video.stem}_edited.mp4")
-            else:
-                fd, tmp_name = tempfile.mkstemp(
-                    prefix=f"{primary_video.stem}_edit_", suffix=".mp4"
-                )
-                os.close(fd)
-                output_path = Path(tmp_name)
-                if not args.keep_temp:
-                    temp_file_to_cleanup = output_path
-
-            video_to_upload = edit_video(inputs, output_path, args)
-        else:
-            video_to_upload = primary_video
-
-        if args.no_upload:
-            print(f"Done! Edited video available at: {video_to_upload}")
-            return
-
         try:
+            if needs_edit:
+                if args.output:
+                    output_path = Path(args.output).expanduser().resolve()
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                elif args.no_upload:
+                    output_path = primary_video.with_name(f"{primary_video.stem}_edited.mp4")
+                else:
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix=f"{primary_video.stem}_edit_", suffix=".mp4"
+                    )
+                    os.close(fd)
+                    output_path = Path(tmp_name)
+                    if not args.keep_temp:
+                        temp_file_to_cleanup = output_path
+
+                video_to_upload = edit_video(inputs, output_path, args)
+            else:
+                video_to_upload = primary_video
+
+            if args.no_upload:
+                print(f"Done! Edited video available at: {video_to_upload}")
+                return
+
             access_token = get_access_token(
                 args.client_secret,
                 require_manage_scope=False,
