@@ -579,6 +579,7 @@ def has_editing_options(args: argparse.Namespace, num_inputs: int) -> bool:
         "fps",
         "crf",
         "bitrate",
+        "max_size",
         "hwaccel",
         "encoder",
         "speed",
@@ -606,6 +607,7 @@ def can_use_fast_copy(args: argparse.Namespace, num_inputs: int) -> bool:
         "fps",
         "crf",
         "bitrate",
+        "max_size",
         "hwaccel",
         "encoder",
         "speed",
@@ -980,21 +982,53 @@ def edit_video(
     cmd.extend(["-filter_complex", filter_complex])
     cmd.extend(["-map", f"[{v_curr}]"])
 
+    out_dur = estimate_output_duration(probes, args)
+    max_size_mb = getattr(args, "max_size", None)
+    computed_v_bitrate = None
+    audio_bitrate_str = "192k"
+
+    if max_size_mb is not None:
+        if max_size_mb <= 0:
+            raise ValueError("--max-size must be > 0 MB")
+        # Reserve 6% safety margin for MP4 container overhead & encoder CBR variance
+        safe_bytes = max_size_mb * 1024 * 1024 * 0.94
+        total_kbps = int((safe_bytes * 8) / max(out_dur, 0.5) / 1000)
+        audio_kbps = 0 if a_curr is None else (128 if total_kbps < 2200 else 192)
+        audio_bitrate_str = f"{audio_kbps}k"
+        video_kbps = max(total_kbps - audio_kbps, 150)
+        computed_v_bitrate = f"{video_kbps}k"
+        LOGGER.step(
+            f"Max File Size Budget (--max-size {max_size_mb} MB)",
+            f"Duration={out_dur:.1f}s -> Total budget={total_kbps} kbps (Video={video_kbps} kbps, Audio={audio_kbps} kbps, 6% container/CBR margin)",
+            "Bitrate (kbps) = (Target_MB * 1024 * 1024 * 8 * 0.94) / Duration_seconds / 1000.",
+        )
+
     if a_curr is not None:
         a_map = f"[{a_curr}]" if not a_curr.endswith(":a") else a_curr
-        cmd.extend(["-map", a_map, "-c:a", "aac", "-b:a", "192k"])
+        cmd.extend(["-map", a_map, "-c:a", "aac", "-b:a", audio_bitrate_str])
     else:
         cmd.append("-an")
+
+    if args.fps:
+        cmd.extend(["-r", str(args.fps)])
+        LOGGER.step(
+            "Output Stream Frame Rate (-r)",
+            f"-r {args.fps}",
+            "Passing -r on the output stream ensures hardware encoders (h264_mediacodec) initialize their per-frame bit budget at the target FPS rather than the source container's FPS.",
+        )
 
     encoder = getattr(args, "encoder", None) or (
         "h264_mediacodec" if getattr(args, "hwaccel", False) else "libx264"
     )
+    target_bitrate = computed_v_bitrate or getattr(args, "bitrate", None)
+
     if encoder in ("h264_mediacodec", "hevc_mediacodec"):
-        bitrate = getattr(args, "bitrate", None) or "8M"
+        bitrate = target_bitrate or "8M"
+        cmd.extend(["-c:v", encoder])
+        if max_size_mb is not None:
+            cmd.extend(["-bitrate_mode", "cbr"])
         cmd.extend(
             [
-                "-c:v",
-                encoder,
                 "-b:v",
                 str(bitrate),
                 "-movflags",
@@ -1004,29 +1038,36 @@ def edit_video(
         )
         LOGGER.step(
             "Video Encoder (Hardware MediaCodec)",
-            f"codec={encoder}, target bitrate={bitrate}, +faststart",
-            "Android MediaCodec offloads H.264/HEVC encoding to the SoC hardware video block, running ~6x faster with ~19x lower CPU usage than software libx264.",
+            f"codec={encoder}, bitrate_mode={'cbr' if max_size_mb else 'default'}, target bitrate={bitrate}, +faststart",
+            "Android MediaCodec offloads H.264/HEVC encoding to the SoC hardware video block; CBR mode enforces strict adherence to the target bitrate cap.",
         )
     else:
-        crf = args.crf if args.crf is not None else 23
-        cmd.extend(
-            [
-                "-c:v",
-                "libx264",
-                "-preset",
-                args.preset,
-                "-crf",
-                str(crf),
-            ]
-        )
-        if getattr(args, "bitrate", None):
-            cmd.extend(["-maxrate", str(args.bitrate), "-bufsize", str(args.bitrate)])
+        cmd.extend(["-c:v", "libx264", "-preset", args.preset])
+        if target_bitrate:
+            cmd.extend(
+                [
+                    "-b:v",
+                    str(target_bitrate),
+                    "-maxrate",
+                    str(target_bitrate),
+                    "-bufsize",
+                    str(target_bitrate),
+                ]
+            )
+            LOGGER.step(
+                "Video Encoder (Software libx264 Rate-Capped)",
+                f"preset={args.preset}, b:v={target_bitrate}, maxrate={target_bitrate}, +faststart",
+                "Using VBV maxrate/bufsize constrains libx264 so the output never exceeds the target file size.",
+            )
+        else:
+            crf = args.crf if args.crf is not None else 23
+            cmd.extend(["-crf", str(crf)])
+            LOGGER.step(
+                "Video Encoder (Software libx264)",
+                f"preset={args.preset}, crf={crf}, +faststart",
+                "CRF (Constant Rate Factor) adjusts bitrate dynamically per frame complexity; +faststart moves the MP4 moov atom to the front for instant streaming.",
+            )
         cmd.extend(["-movflags", "+faststart", str(output_path)])
-        LOGGER.step(
-            "Video Encoder (Software libx264)",
-            f"preset={args.preset}, crf={crf}, +faststart",
-            "CRF (Constant Rate Factor) adjusts bitrate dynamically per frame complexity; +faststart moves the MP4 moov atom to the front for instant streaming.",
-        )
 
     LOGGER.cmd(cmd)
     LOGGER.info(f"Editing video with FFmpeg ({encoder}) -> {output_path.name}...")
@@ -1566,6 +1607,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Target video bitrate (e.g. '8M', '5M'; default '8M' when using MediaCodec).",
+    )
+    edit_grp.add_argument(
+        "--max-size",
+        type=float,
+        default=None,
+        metavar="MB",
+        help="Maximum output file size in MB (e.g. 100); automatically calculates video/audio bitrate cap.",
     )
     edit_grp.add_argument(
         "--speed",
