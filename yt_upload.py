@@ -16,6 +16,7 @@ import http.server
 import json
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
@@ -846,6 +848,48 @@ def edit_video(
 # =====================================================================
 
 
+def parse_publish_at(value: str) -> str:
+    """Convert a --publish-at value into the RFC 3339 UTC string YouTube expects.
+
+    Accepts local times ('2026-11-20 18:00'), ISO 8601 with an offset
+    ('2026-11-20T18:00:00+01:00', '...Z'), or relative times ('+30m', '+2h', '+1d').
+    """
+    s = value.strip()
+    now = datetime.now(timezone.utc)
+    rel = re.fullmatch(r"\+\s*(\d+)\s*([mhd])", s, re.IGNORECASE)
+    if rel:
+        unit = {"m": "minutes", "h": "hours", "d": "days"}[rel.group(2).lower()]
+        dt = now + timedelta(**{unit: int(rel.group(1))})
+    else:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00").replace("z", "+00:00"))
+        except ValueError:
+            raise ValueError(
+                f"Invalid --publish-at '{value}'. Use 'YYYY-MM-DD HH:MM' (local time), "
+                "ISO 8601 with an offset (e.g. 2026-11-20T18:00:00Z), or a relative "
+                "time like +30m, +2h, +1d."
+            )
+        if dt.tzinfo is None:
+            dt = dt.astimezone()  # naive times are the phone's local time
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+    if dt <= now:
+        raise ValueError(
+            f"--publish-at must be in the future (got {format_publish_time(dt)})."
+        )
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def format_publish_time(value: datetime | str) -> str:
+    """Render a publish time as 'local time (UTC time)' for display."""
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    local = value.astimezone()
+    utc_text = f"{value.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC"
+    if local.utcoffset() == timedelta(0):
+        return utc_text
+    return f"{local:%Y-%m-%d %H:%M %Z} ({utc_text})"
+
+
 RETRYABLE_STATUS = (500, 502, 503, 504)
 
 
@@ -909,6 +953,7 @@ def upload_video(
     category_id: str,
     privacy_status: str,
     made_for_kids: bool,
+    publish_at: str | None = None,
 ) -> str:
     """Upload a video file using YouTube Data API v3 Resumable Upload."""
     metadata = {
@@ -923,6 +968,8 @@ def upload_video(
             "selfDeclaredMadeForKids": made_for_kids,
         },
     }
+    if publish_at:
+        metadata["status"]["publishAt"] = publish_at
     metadata_bytes = json.dumps(metadata).encode("utf-8")
     file_size = file_path.stat().st_size
 
@@ -1003,6 +1050,8 @@ def upload_video(
     print("\nUpload Complete!")
     print(f"Video ID:   {video_id}")
     print(f"Watch URL:  https://youtu.be/{video_id}")
+    if publish_at:
+        print(f"Scheduled:  goes public {format_publish_time(publish_at)}")
     print(f"Studio URL: https://studio.youtube.com/video/{video_id}/edit")
     return video_id
 
@@ -1048,6 +1097,7 @@ def update_video_metadata(
     category_id: str | None = None,
     privacy_status: str | None = None,
     made_for_kids: bool | None = None,
+    publish_at: str | None = None,
 ) -> dict:
     """Fetch and update snippet/status metadata of an existing YouTube video."""
     list_url = (
@@ -1086,6 +1136,9 @@ def update_video_metadata(
         status["privacyStatus"] = privacy_status
     if made_for_kids is not None:
         status["selfDeclaredMadeForKids"] = made_for_kids
+    if publish_at is not None:
+        status["privacyStatus"] = "private"
+        status["publishAt"] = publish_at
 
     payload = {
         "id": video_id,
@@ -1099,6 +1152,10 @@ def update_video_metadata(
             "selfDeclaredMadeForKids": status.get("selfDeclaredMadeForKids", False),
         },
     }
+    # Keep an existing schedule unless the video is being made public/unlisted now;
+    # omitting publishAt from the PUT would otherwise cancel it.
+    if status.get("publishAt") and payload["status"]["privacyStatus"] == "private":
+        payload["status"]["publishAt"] = status["publishAt"]
     if "tags" in snippet:
         payload["snippet"]["tags"] = snippet["tags"]
 
@@ -1118,6 +1175,9 @@ def update_video_metadata(
         with urllib.request.urlopen(put_req) as resp:
             updated = json.loads(resp.read().decode("utf-8"))
         print(f"Metadata updated successfully! Watch URL: https://youtu.be/{video_id}")
+        scheduled = (updated.get("status") or {}).get("publishAt")
+        if scheduled:
+            print(f"Scheduled to go public {format_publish_time(scheduled)}")
         return updated
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")
@@ -1356,6 +1416,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Privacy status (default: unlisted for new uploads).",
     )
     meta_grp.add_argument(
+        "--publish-at",
+        type=str,
+        metavar="WHEN",
+        help=(
+            "Schedule the video to go public later (uploaded as private until then). "
+            "Accepts local time '2026-11-20 18:00', ISO 8601 '2026-11-20T18:00:00Z', "
+            "or relative '+30m', '+2h', '+1d'. Also works with --update-video."
+        ),
+    )
+    meta_grp.add_argument(
         "--category",
         "-c",
         type=str,
@@ -1404,6 +1474,19 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    publish_at = None
+    if args.publish_at:
+        try:
+            publish_at = parse_publish_at(args.publish_at)
+        except ValueError as e:
+            parser.error(str(e))
+        if args.privacy not in (None, "private"):
+            parser.error(
+                "--publish-at requires the video to stay private until the scheduled time; "
+                f"remove --privacy {args.privacy}."
+            )
+        print(f"Will schedule publishing for {format_publish_time(publish_at)}")
+
     try:
         # Mode 1: Auth-only
         if args.auth_only:
@@ -1435,6 +1518,7 @@ def main():
                     args.category,
                     args.privacy,
                     args.made_for_kids,
+                    publish_at,
                 )
             )
             if has_meta_changes:
@@ -1447,6 +1531,7 @@ def main():
                     category_id=args.category,
                     privacy_status=args.privacy,
                     made_for_kids=args.made_for_kids,
+                    publish_at=publish_at,
                 )
             if args.thumbnail:
                 upload_thumbnail(
@@ -1456,7 +1541,7 @@ def main():
                 )
             if not has_meta_changes and not args.thumbnail:
                 sys.exit(
-                    "Error: With --update-video, specify at least one metadata flag (--title, --description, --privacy, --tags, etc.) or --thumbnail."
+                    "Error: With --update-video, specify at least one metadata flag (--title, --description, --privacy, --tags, --publish-at, etc.) or --thumbnail."
                 )
             return
 
@@ -1511,7 +1596,7 @@ def main():
                 else []
             )
             category_id = args.category or "22"
-            privacy_status = args.privacy or "unlisted"
+            privacy_status = "private" if publish_at else (args.privacy or "unlisted")
             made_for_kids = bool(args.made_for_kids)
 
             video_id = upload_video(
@@ -1523,6 +1608,7 @@ def main():
                 category_id=category_id,
                 privacy_status=privacy_status,
                 made_for_kids=made_for_kids,
+                publish_at=publish_at,
             )
 
             if args.thumbnail and video_id and video_id != "unknown":
