@@ -16,8 +16,10 @@ import http.server
 import json
 import mimetypes
 import os
+import platform
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -42,6 +44,7 @@ DEFAULT_TOKEN_PATH = CONFIG_DIR / "token.json"
 DEFAULT_SECRET_PATH = CONFIG_DIR / "client_secret.json"
 DOWNLOAD_DIR = Path("/storage/emulated/0/Download")
 CAMERA_DIR = Path("/storage/emulated/0/DCIM/Camera")
+DEFAULT_LOG_PATH = CAMERA_DIR / "yt_upload.log"
 
 RESOLUTION_MAP = {
     "2160p": (3840, 2160),
@@ -55,6 +58,50 @@ ANDROID_FONTS = [
     Path("/system/fonts/DroidSans.ttf"),
     Path("/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf"),
 ]
+
+
+class DevLogger:
+    """Developer & learning logger that records detailed pipeline internals to a log file."""
+
+    def __init__(self, log_path: Path | None = DEFAULT_LOG_PATH, enabled: bool = True):
+        self.enabled = enabled and (log_path is not None)
+        self.log_path = log_path
+        if self.enabled and self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _write(self, level: str, msg: str) -> None:
+        if not self.enabled or not self.log_path:
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.log_path.open("a", encoding="utf-8") as f:
+            for line in msg.splitlines() or [""]:
+                f.write(f"[{ts}] [{level}] {line}\n")
+
+    def section(self, title: str) -> None:
+        bar = "=" * 72
+        self._write("SECTION", bar)
+        self._write("SECTION", f"  {title}")
+        self._write("SECTION", bar)
+
+    def info(self, msg: str, console: bool = True) -> None:
+        if console:
+            print(msg, flush=True)
+        self._write("INFO", msg)
+
+    def step(self, step_name: str, detail: str, why: str | None = None) -> None:
+        self._write("STEP", f"{step_name}: {detail}")
+        if why:
+            self._write("LEARN", f"  -> Why: {why}")
+
+    def cmd(self, cmd_list: list[str]) -> None:
+        quoted = " ".join(shlex.quote(str(c)) for c in cmd_list)
+        self._write("COMMAND", f"Full reproducible command:\n  {quoted}")
+
+    def error(self, msg: str) -> None:
+        self._write("ERROR", msg)
+
+
+LOGGER = DevLogger(enabled=False)
 
 
 def write_private(path: Path, data: str | bytes) -> None:
@@ -381,21 +428,25 @@ def probe_video(path: Path) -> dict:
     if not video_stream:
         raise ValueError(f"No video stream found in {path}")
 
-    width = int(video_stream.get("width", 1920))
-    height = int(video_stream.get("height", 1080))
+    raw_width = int(video_stream.get("width", 1920))
+    raw_height = int(video_stream.get("height", 1080))
+    width, height = raw_width, raw_height
 
     # Account for rotation metadata in mobile camera recordings
     rotation = 0
+    signed_rotation = 0
     tags = video_stream.get("tags", {}) or {}
     if "rotate" in tags:
         try:
-            rotation = int(tags["rotate"])
+            signed_rotation = int(tags["rotate"])
+            rotation = abs(signed_rotation)
         except ValueError:
             pass
     for sd in video_stream.get("side_data_list", []):
         if "rotation" in sd:
             try:
-                rotation = abs(int(sd["rotation"]))
+                signed_rotation = int(sd["rotation"])
+                rotation = abs(signed_rotation)
             except ValueError:
                 pass
     if rotation in (90, 270):
@@ -416,13 +467,51 @@ def probe_video(path: Path) -> dict:
     elif r_frame_rate:
         fps = float(r_frame_rate)
 
+    fmt_info = data.get("format", {}) or {}
+    video_bitrate = int(video_stream.get("bit_rate") or fmt_info.get("bit_rate") or 0)
+    file_size = int(fmt_info.get("size") or (path.stat().st_size if path.exists() else 0))
+
     return {
         "width": width,
         "height": height,
+        "raw_width": raw_width,
+        "raw_height": raw_height,
+        "rotation": signed_rotation,
         "duration": duration,
         "fps": round(fps, 2) if fps > 0 else 30.0,
+        "video_codec": video_stream.get("codec_name", "unknown"),
+        "profile": video_stream.get("profile", "unknown"),
+        "pix_fmt": video_stream.get("pix_fmt", "unknown"),
+        "video_bitrate": video_bitrate,
+        "file_size": file_size,
         "has_audio": audio_stream is not None,
+        "audio_codec": audio_stream.get("codec_name", "none") if audio_stream else "none",
+        "sample_rate": int(audio_stream.get("sample_rate", 48000)) if audio_stream else 0,
+        "channels": int(audio_stream.get("channels", 0)) if audio_stream else 0,
+        "audio_bitrate": int(audio_stream.get("bit_rate", 0)) if audio_stream else 0,
     }
+
+
+def format_probe_summary(path: Path, meta: dict) -> str:
+    """Format a human-readable developer summary of probed video metadata."""
+    size_mb = meta["file_size"] / (1024 * 1024)
+    v_mbps = meta["video_bitrate"] / 1_000_000
+    rot_note = (
+        f" (stored {meta['raw_width']}x{meta['raw_height']} with {meta['rotation']}° display matrix)"
+        if meta["rotation"]
+        else ""
+    )
+    aud_note = (
+        f"{meta['audio_codec']} {meta['sample_rate']}Hz {meta['channels']}ch ({meta['audio_bitrate'] // 1000} kbps)"
+        if meta["has_audio"]
+        else "No audio"
+    )
+    return (
+        f"File: {path.name} ({size_mb:.1f} MB, {meta['duration']:.2f}s)\n"
+        f"  Video: {meta['video_codec']} ({meta['profile']}, {meta['pix_fmt']}) "
+        f"{meta['width']}x{meta['height']}{rot_note} @ {meta['fps']} fps, {v_mbps:.2f} Mbps\n"
+        f"  Audio: {aud_note}"
+    )
 
 
 def build_atempo_chain(speed: float) -> str:
@@ -489,6 +578,9 @@ def has_editing_options(args: argparse.Namespace, num_inputs: int) -> bool:
         "resolution",
         "fps",
         "crf",
+        "bitrate",
+        "hwaccel",
+        "encoder",
         "speed",
         "text",
         "subtitles",
@@ -513,6 +605,9 @@ def can_use_fast_copy(args: argparse.Namespace, num_inputs: int) -> bool:
         "resolution",
         "fps",
         "crf",
+        "bitrate",
+        "hwaccel",
+        "encoder",
         "speed",
         "text",
         "subtitles",
@@ -529,6 +624,7 @@ def edit_video(
 ) -> Path:
     """Execute the FFmpeg editing pipeline on one or more input videos."""
     ensure_ffmpeg()
+    LOGGER.section(f"VIDEO EDITING PIPELINE -> {output_path.name}")
 
     if can_use_fast_copy(args, len(inputs)):
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info"]
@@ -544,11 +640,20 @@ def edit_video(
         else:
             cmd.extend(["-c:a", "copy"])
         cmd.extend(["-c:v", "copy", "-movflags", "+faststart", str(output_path)])
-        print(f"Running fast stream-copy edit -> {output_path.name}...")
+        LOGGER.step(
+            "Fast Stream Copy (-c copy)",
+            f"Trimming/copying {inputs[0].name} without re-encoding",
+            "Stream copy avoids decoding/encoding packets, preserving 100% original quality in seconds.",
+        )
+        LOGGER.cmd(cmd)
+        LOGGER.info(f"Running fast stream-copy edit -> {output_path.name}...")
         subprocess.run(cmd, check=True)
         return output_path
 
     probes = [probe_video(p) for p in inputs]
+    for p, meta in zip(inputs, probes):
+        LOGGER.info(format_probe_summary(p, meta), console=True)
+
     first_probe = probes[0]
 
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats"]
@@ -557,10 +662,17 @@ def edit_video(
     if len(inputs) == 1:
         if args.trim_start is not None:
             cmd.extend(["-ss", str(args.trim_start)])
+            LOGGER.step(
+                "Input Trim Start (-ss)",
+                f"Seeking to {args.trim_start} before input -i",
+                "Placing -ss before -i enables fast keyframe input seeking in FFmpeg.",
+            )
         if args.trim_end is not None:
             cmd.extend(["-to", str(args.trim_end)])
+            LOGGER.step("Input Trim End (-to)", f"Stopping at {args.trim_end}")
         elif args.duration is not None:
             cmd.extend(["-t", str(args.duration)])
+            LOGGER.step("Input Duration (-t)", f"Capturing {args.duration} duration")
 
     for p in inputs:
         cmd.extend(["-i", str(p)])
@@ -593,6 +705,12 @@ def edit_video(
         target_w = target_w - (target_w % 2)
         target_h = target_h - (target_h % 2)
 
+        LOGGER.step(
+            "Multi-Clip Concat",
+            f"Normalizing {len(inputs)} clips to {target_w}x{target_h} @ {target_fps}fps before concat filter",
+            "FFmpeg's concat filter requires all input segments to share identical resolution, SAR, pixel format, and audio sample rate.",
+        )
+
         concat_inputs = []
         for idx, meta in enumerate(probes):
             filter_parts.append(
@@ -603,12 +721,12 @@ def edit_video(
             if need_audio_from_inputs:
                 if meta["has_audio"]:
                     filter_parts.append(
-                        f"[{idx}:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[acat{idx}]"
+                        f"[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[acat{idx}]"
                     )
                 else:
                     dur = max(meta["duration"], 0.1)
                     filter_parts.append(
-                        f"anullsrc=channel_layout=stereo:sample_rate=44100:d={dur}[acat{idx}]"
+                        f"anullsrc=channel_layout=stereo:sample_rate=48000:d={dur}[acat{idx}]"
                     )
                 concat_inputs.append(f"[vcat{idx}][acat{idx}]")
             else:
@@ -652,6 +770,12 @@ def edit_video(
         v_curr = "0:v"
         has_source_audio = first_probe["has_audio"] and need_audio_from_inputs
         a_curr = "0:a" if has_source_audio else None
+        if first_probe["rotation"]:
+            LOGGER.step(
+                "Auto-Rotation",
+                f"Input has {first_probe['rotation']}° display matrix ({first_probe['raw_width']}x{first_probe['raw_height']} -> {first_probe['width']}x{first_probe['height']})",
+                "FFmpeg automatically rotates decoded frames into display orientation before running -filter_complex and clears the rotation tag on output.",
+            )
 
     v_step = 0
 
@@ -666,13 +790,21 @@ def edit_video(
     # Step 2: Rotation
     if args.rotate == 90:
         next_v("transpose=1")
+        LOGGER.step("Rotate", "90° clockwise (transpose=1)")
     elif args.rotate == 180:
         next_v("transpose=2,transpose=2")
+        LOGGER.step("Rotate", "180° (transpose=2,transpose=2)")
     elif args.rotate == 270:
         next_v("transpose=2")
+        LOGGER.step("Rotate", "270° clockwise (transpose=2)")
 
     # Step 3: Shorts (9:16 1080x1920) OR Resolution scaling
     if args.shorts:
+        LOGGER.step(
+            "YouTube Shorts 9:16",
+            f"Formatting to 1080x1920 vertical using mode='{args.shorts_mode}'",
+            "YouTube Shorts require a 9:16 vertical aspect ratio (1080x1920) and <= 60s (or <= 3m) duration.",
+        )
         if args.shorts_mode == "crop":
             next_v(
                 "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1"
@@ -705,10 +837,16 @@ def edit_video(
             f"scale='min({max_w},iw)':'min({max_h},ih)':force_original_aspect_ratio=decrease,"
             "scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1"
         )
+        LOGGER.step(
+            "Resolution Scaling",
+            f"Bounding box {max_w}x{max_h} ({'portrait' if is_portrait else 'landscape'} {args.resolution})",
+            "Swapping width/height bounds when portrait prevents accidentally shrinking a 1080x1920 vertical video down to 608x1080.",
+        )
 
     # Step 4: Frame rate
     if args.fps:
         next_v(f"fps={args.fps}")
+        LOGGER.step("Frame Rate", f"Target {args.fps} fps")
 
     # Step 5: Watermark overlay
     if watermark_idx is not None:
@@ -728,6 +866,7 @@ def edit_video(
             f"[{v_curr}][wm{v_step}]overlay={coords}[{out_label}]"
         )
         v_curr = out_label
+        LOGGER.step("Watermark Overlay", f"Position={args.watermark_pos}, width={wm_scale}px")
 
     # Step 6: Burn-in Subtitles (.srt / .ass)
     if args.subtitles:
@@ -736,6 +875,7 @@ def edit_video(
             raise FileNotFoundError(f"Subtitles file not found: {sub_path}")
         escaped_sub = escape_filter_path(sub_path)
         next_v(f"subtitles='{escaped_sub}'")
+        LOGGER.step("Subtitles", f"Burn-in from {sub_path.name}")
 
     # Step 7: Text Overlay (drawtext). The text is passed via a temp file with
     # expansion disabled so characters like % : ' \\ need no escaping.
@@ -759,13 +899,24 @@ def edit_video(
             f"x=(w-text_w)/2:y={y_expr}:"
             f"box=1:boxcolor=black@0.55:boxborderw=12"
         )
+        LOGGER.step("Text Overlay", f"'{args.text}' at {args.text_pos} (via temp textfile)")
 
     # Step 8: Speed adjustment (video + audio)
     if args.speed and abs(args.speed - 1.0) > 1e-4:
         next_v(f"setpts=PTS/{args.speed:.4f}")
+        LOGGER.step(
+            "Video Speed",
+            f"Multiplier {args.speed}x (setpts=PTS/{args.speed:.4f})",
+            "Dividing presentation timestamps (PTS) by speed factor speeds up (>1) or slows down (<1) video playback.",
+        )
 
     # Ensure yuv420p pixel format and even dimensions for universal playback
     next_v("scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p")
+    LOGGER.step(
+        "Pixel Format & Alignment",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+        "H.264/HEVC encoders and web players require even width/height and 4:2:0 planar chroma subsampling (yuv420p).",
+    )
 
     # Step 9: Audio processing pipeline
     a_step = 0
@@ -780,11 +931,28 @@ def edit_video(
 
     if a_curr is not None:
         if args.speed and abs(args.speed - 1.0) > 1e-4:
-            next_a(build_atempo_chain(args.speed))
+            atempo_chain = build_atempo_chain(args.speed)
+            next_a(atempo_chain)
+            LOGGER.step(
+                "Audio Speed (atempo)",
+                atempo_chain,
+                "Each FFmpeg atempo filter only accepts [0.5, 2.0], so speeds outside that range are chained.",
+            )
         if args.volume and abs(args.volume - 1.0) > 1e-4:
             next_a(f"volume={args.volume}")
+            LOGGER.step("Audio Volume", f"Multiplier {args.volume}x")
         if args.normalize_audio:
-            next_a("loudnorm=I=-16:TP=-1.5:LRA=11")
+            target_sr = first_probe.get("sample_rate") or 48000
+            if target_sr not in (44100, 48000):
+                target_sr = 48000
+            next_a(f"loudnorm=I=-16:TP=-1.5:LRA=11,aresample={target_sr}")
+            LOGGER.step(
+                "Audio Loudness Normalization (EBU R128)",
+                f"loudnorm=I=-16:TP=-1.5:LRA=11,aresample={target_sr}",
+                f"Targets -16 LUFS integrated loudness & -1.5 dBTP true peak (YouTube standard). "
+                f"Appending aresample={target_sr} is critical because FFmpeg's loudnorm filter internally upsamples to 192 kHz, "
+                f"which would otherwise cause the AAC encoder to output 96 kHz instead of {target_sr} Hz.",
+            )
 
     if bgm_idx is not None:
         a_step += 1
@@ -793,7 +961,7 @@ def edit_video(
         # instead of relying on -shortest (which fails on some ffmpeg builds).
         out_dur = estimate_output_duration(probes, args)
         filter_parts.append(
-            f"[{bgm_idx}:a]volume={args.bgm_volume},aresample=44100,"
+            f"[{bgm_idx}:a]volume={args.bgm_volume},aresample=48000,"
             f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
             f"atrim=duration={out_dur:.3f}[{bgm_label}]"
         )
@@ -806,6 +974,7 @@ def edit_video(
             a_curr = mixed_label
         else:
             a_curr = bgm_label
+        LOGGER.step("Background Music (BGM)", f"Mixed at volume={args.bgm_volume}, bounded to {out_dur:.2f}s")
 
     filter_complex = ";".join(filter_parts)
     cmd.extend(["-filter_complex", filter_complex])
@@ -817,29 +986,73 @@ def edit_video(
     else:
         cmd.append("-an")
 
-    crf = args.crf if args.crf is not None else 23
-    cmd.extend(
-        [
-            "-c:v",
-            "libx264",
-            "-preset",
-            args.preset,
-            "-crf",
-            str(crf),
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
+    encoder = getattr(args, "encoder", None) or (
+        "h264_mediacodec" if getattr(args, "hwaccel", False) else "libx264"
     )
+    if encoder in ("h264_mediacodec", "hevc_mediacodec"):
+        bitrate = getattr(args, "bitrate", None) or "8M"
+        cmd.extend(
+            [
+                "-c:v",
+                encoder,
+                "-b:v",
+                str(bitrate),
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ]
+        )
+        LOGGER.step(
+            "Video Encoder (Hardware MediaCodec)",
+            f"codec={encoder}, target bitrate={bitrate}, +faststart",
+            "Android MediaCodec offloads H.264/HEVC encoding to the SoC hardware video block, running ~6x faster with ~19x lower CPU usage than software libx264.",
+        )
+    else:
+        crf = args.crf if args.crf is not None else 23
+        cmd.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                args.preset,
+                "-crf",
+                str(crf),
+            ]
+        )
+        if getattr(args, "bitrate", None):
+            cmd.extend(["-maxrate", str(args.bitrate), "-bufsize", str(args.bitrate)])
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
+        LOGGER.step(
+            "Video Encoder (Software libx264)",
+            f"preset={args.preset}, crf={crf}, +faststart",
+            "CRF (Constant Rate Factor) adjusts bitrate dynamically per frame complexity; +faststart moves the MP4 moov atom to the front for instant streaming.",
+        )
 
-    print(f"Editing video with FFmpeg -> {output_path.name}...")
+    LOGGER.cmd(cmd)
+    LOGGER.info(f"Editing video with FFmpeg ({encoder}) -> {output_path.name}...")
+    t0 = time.time()
     try:
         subprocess.run(cmd, check=True)
     finally:
         if text_file is not None:
             text_file.unlink(missing_ok=True)
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"Edited video saved: {output_path} ({size_mb:.1f} MB)")
+    elapsed = max(time.time() - t0, 0.001)
+
+    out_probe = probe_video(output_path)
+    in_total_bytes = sum(m["file_size"] for m in probes)
+    out_bytes = out_probe["file_size"]
+    in_mb = in_total_bytes / (1024 * 1024)
+    out_mb = out_bytes / (1024 * 1024)
+    pct_change = ((out_bytes - in_total_bytes) / in_total_bytes * 100) if in_total_bytes > 0 else 0.0
+    realtime_speed = out_probe["duration"] / elapsed if elapsed > 0 else 0.0
+
+    LOGGER.info(format_probe_summary(output_path, out_probe), console=True)
+    summary_line = (
+        f"Edited video saved: {output_path} | "
+        f"{in_mb:.1f} MB -> {out_mb:.1f} MB ({pct_change:+.1f}%) | "
+        f"Encoded in {elapsed:.1f}s ({realtime_speed:.2f}x realtime)"
+    )
+    LOGGER.info(summary_line, console=True)
     return output_path
 
 
@@ -1227,7 +1440,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         type=str,
         metavar="PATH",
-        help="Multiple video files to merge/concatenate in order.",
+        help="Multiple video files to merge/concatenate (or edit individually with --batch).",
     )
     in_grp.add_argument(
         "--latest",
@@ -1238,7 +1451,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--latest-n",
         type=int,
         metavar="N",
-        help="Merge the N most recent videos in DCIM/Camera (in chronological order).",
+        help="Select the N most recent videos in DCIM/Camera (in chronological order).",
+    )
+    in_grp.add_argument(
+        "--batch",
+        action="store_true",
+        help="When multiple files are selected (--files or --latest-n), edit each video individually instead of merging.",
+    )
+
+    # Developer Logging Options
+    log_grp = parser.add_argument_group("Developer Logging & Diagnostics")
+    log_grp.add_argument(
+        "--log-file",
+        type=str,
+        default=str(DEFAULT_LOG_PATH),
+        help=f"Path to developer/learning log file (default: {DEFAULT_LOG_PATH}).",
+    )
+    log_grp.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable writing to the developer log file.",
     )
 
     # Video Editing Options
@@ -1317,6 +1549,23 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
         default="fast",
         help="FFmpeg x264 encoding speed/compression preset (default: fast).",
+    )
+    edit_grp.add_argument(
+        "--hwaccel",
+        action="store_true",
+        help="Use Android hardware MediaCodec encoder (h264_mediacodec) for ~6x faster encoding on Termux.",
+    )
+    edit_grp.add_argument(
+        "--encoder",
+        choices=["libx264", "h264_mediacodec", "hevc_mediacodec"],
+        default=None,
+        help="Explicitly select video encoder (libx264, h264_mediacodec, hevc_mediacodec).",
+    )
+    edit_grp.add_argument(
+        "--bitrate",
+        type=str,
+        default=None,
+        help="Target video bitrate (e.g. '8M', '5M'; default '8M' when using MediaCodec).",
     )
     edit_grp.add_argument(
         "--speed",
@@ -1460,19 +1709,29 @@ def resolve_input_files(args: argparse.Namespace) -> list[Path]:
         if args.latest_n < 1:
             sys.exit("Error: --latest-n must be >= 1")
         inputs = find_latest_videos(args.latest_n)
-        print(f"Selected {len(inputs)} latest video(s):")
+        LOGGER.info(f"Selected {len(inputs)} latest video(s):")
         for p in inputs:
-            print(f"  - {p}")
+            LOGGER.info(f"  - {p}")
     elif args.latest:
         p = find_latest_video()
-        print(f"Selected latest video: {p}")
+        LOGGER.info(f"Selected latest video: {p}")
         inputs.append(p)
     return inputs
 
 
 def main():
+    global LOGGER
     parser = build_parser()
     args = parser.parse_args()
+
+    log_path = Path(args.log_file).expanduser().resolve() if args.log_file else None
+    LOGGER = DevLogger(log_path=log_path, enabled=not args.no_log)
+    LOGGER.section("YT_UPLOAD SESSION START")
+    LOGGER.info(
+        f"CLI Invocation: {' '.join(shlex.quote(a) for a in sys.argv)}\n"
+        f"Python: {sys.version.split()[0]} on {platform.platform()}",
+        console=False,
+    )
 
     publish_at = None
     if args.publish_at:
@@ -1485,7 +1744,7 @@ def main():
                 "--publish-at requires the video to stay private until the scheduled time; "
                 f"remove --privacy {args.privacy}."
             )
-        print(f"Will schedule publishing for {format_publish_time(publish_at)}")
+        LOGGER.info(f"Will schedule publishing for {format_publish_time(publish_at)}")
 
     try:
         # Mode 1: Auth-only
@@ -1553,80 +1812,104 @@ def main():
                 "\nError: Provide --file, --files, --latest, --latest-n, --update-video, or --auth-only."
             )
 
-        primary_video = inputs[0]
-        needs_edit = has_editing_options(args, len(inputs))
-        temp_file_to_cleanup: Path | None = None
+        # If --batch is set with multiple files, process each file individually
+        batches: list[list[Path]] = (
+            [[p] for p in inputs] if (args.batch and len(inputs) > 1) else [inputs]
+        )
 
-        try:
-            if needs_edit:
-                if args.output:
-                    output_path = Path(args.output).expanduser().resolve()
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                elif args.no_upload:
-                    output_path = primary_video.with_name(f"{primary_video.stem}_edited.mp4")
-                else:
-                    fd, tmp_name = tempfile.mkstemp(
-                        prefix=f"{primary_video.stem}_edit_", suffix=".mp4"
-                    )
-                    os.close(fd)
-                    output_path = Path(tmp_name)
-                    if not args.keep_temp:
-                        temp_file_to_cleanup = output_path
-
-                video_to_upload = edit_video(inputs, output_path, args)
-            else:
-                video_to_upload = primary_video
-
-            if args.no_upload:
-                print(f"Done! Edited video available at: {video_to_upload}")
-                return
-
-            access_token = get_access_token(
-                args.client_secret,
-                require_manage_scope=False,
-                force_reauth=args.reauth,
-            )
-            title = args.title or primary_video.stem
-            description = args.description or ""
-            if args.shorts and "#Shorts" not in title and "#Shorts" not in description:
-                description = (description + "\n\n#Shorts").strip()
-            tags = (
-                [t.strip() for t in args.tags.split(",") if t.strip()]
-                if args.tags
-                else []
-            )
-            category_id = args.category or "22"
-            privacy_status = "private" if publish_at else (args.privacy or "unlisted")
-            made_for_kids = bool(args.made_for_kids)
-
-            video_id = upload_video(
-                access_token=access_token,
-                file_path=video_to_upload,
-                title=title,
-                description=description,
-                tags=tags,
-                category_id=category_id,
-                privacy_status=privacy_status,
-                made_for_kids=made_for_kids,
-                publish_at=publish_at,
-            )
-
-            if args.thumbnail and video_id and video_id != "unknown":
-                upload_thumbnail(
-                    access_token=access_token,
-                    video_id=video_id,
-                    thumbnail_path=Path(args.thumbnail),
+        for batch_idx, batch_inputs in enumerate(batches, 1):
+            primary_video = batch_inputs[0]
+            if len(batches) > 1:
+                LOGGER.info(
+                    f"\n--- Batch [{batch_idx}/{len(batches)}]: {primary_video.name} ---"
                 )
-        finally:
-            if temp_file_to_cleanup and temp_file_to_cleanup.exists():
-                try:
-                    temp_file_to_cleanup.unlink()
-                except OSError:
-                    pass
+
+            needs_edit = has_editing_options(args, len(batch_inputs))
+            temp_file_to_cleanup: Path | None = None
+
+            try:
+                if needs_edit:
+                    if args.output and len(batches) == 1:
+                        output_path = Path(args.output).expanduser().resolve()
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                    elif args.no_upload:
+                        output_path = primary_video.with_name(
+                            f"{primary_video.stem}_edited.mp4"
+                        )
+                    else:
+                        fd, tmp_name = tempfile.mkstemp(
+                            prefix=f"{primary_video.stem}_edit_", suffix=".mp4"
+                        )
+                        os.close(fd)
+                        output_path = Path(tmp_name)
+                        if not args.keep_temp:
+                            temp_file_to_cleanup = output_path
+
+                    video_to_upload = edit_video(batch_inputs, output_path, args)
+                else:
+                    video_to_upload = primary_video
+
+                if args.no_upload:
+                    LOGGER.info(f"Done! Edited video available at: {video_to_upload}")
+                    continue
+
+                access_token = get_access_token(
+                    args.client_secret,
+                    require_manage_scope=False,
+                    force_reauth=args.reauth,
+                )
+                title = args.title or primary_video.stem
+                description = args.description or ""
+                if (
+                    args.shorts
+                    and "#Shorts" not in title
+                    and "#Shorts" not in description
+                ):
+                    description = (description + "\n\n#Shorts").strip()
+                tags = (
+                    [t.strip() for t in args.tags.split(",") if t.strip()]
+                    if args.tags
+                    else []
+                )
+                category_id = args.category or "22"
+                privacy_status = (
+                    "private" if publish_at else (args.privacy or "unlisted")
+                )
+                made_for_kids = bool(args.made_for_kids)
+
+                video_id = upload_video(
+                    access_token=access_token,
+                    file_path=video_to_upload,
+                    title=title,
+                    description=description,
+                    tags=tags,
+                    category_id=category_id,
+                    privacy_status=privacy_status,
+                    made_for_kids=made_for_kids,
+                    publish_at=publish_at,
+                )
+
+                if args.thumbnail and video_id and video_id != "unknown":
+                    upload_thumbnail(
+                        access_token=access_token,
+                        video_id=video_id,
+                        thumbnail_path=Path(args.thumbnail),
+                    )
+            finally:
+                if temp_file_to_cleanup and temp_file_to_cleanup.exists():
+                    try:
+                        temp_file_to_cleanup.unlink()
+                    except OSError:
+                        pass
+
+        if LOGGER.enabled and LOGGER.log_path:
+            print(f"\nDeveloper log written to: {LOGGER.log_path}")
 
     except subprocess.CalledProcessError as e:
+        LOGGER.error(f"FFmpeg Error: Command failed with exit code {e.returncode}")
         sys.exit(f"FFmpeg Error: Command failed with exit code {e.returncode}")
     except Exception as e:
+        LOGGER.error(f"Error: {e}")
         sys.exit(f"Error: {e}")
 
 

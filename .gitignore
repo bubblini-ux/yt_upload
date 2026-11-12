@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 research_notes/
 reports/
+*.log
+*_edited.mp4
+
